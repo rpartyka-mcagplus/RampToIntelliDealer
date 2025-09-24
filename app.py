@@ -18,11 +18,13 @@ def clean_amount_series(s):
 uploaded_file = st.file_uploader("Upload a CSV file", type="csv")
 
 if uploaded_file:
-    original_filename = os.path.splitext(uploaded_file.name)[0]  # remove extension for reuse
+    original_filename = os.path.splitext(uploaded_file.name)[0]
 
+    # Define columns to read as strings
     dtype_cols = [
         "Invoice #", "GL Acct", "Vendor", "Vendor#", "Company", "Division", "Discount Amt",
-        "Bank Cost Ctr", "Payables Cost Ctr", "Department", "Location"
+        "Bank Cost Ctr", "Payables Cost Ctr", "Department", "Location", "Invoice Total",
+        "Bank Acct #", "Payables Acct"
     ]
     tmp = pd.read_csv(uploaded_file, nrows=0)
     existing_dtype_cols = [c for c in dtype_cols if c in tmp.columns]
@@ -39,6 +41,7 @@ if uploaded_file:
     if "GL Acct" in df.columns:
         df["GL Acct"] = df["GL Acct"].astype(str)
 
+    # Filter out GL Acct 99999 rows
     filtered_out = pd.DataFrame()
     if "GL Acct" in df.columns:
         filtered_out = df[df["GL Acct"] == "99999"].copy()
@@ -73,6 +76,7 @@ if uploaded_file:
         if "Record ID" not in df.columns:
             df["Record ID"] = np.nan
 
+    # Ensure Department and Location exist
     if "Department" not in df.columns:
         df["Department"] = ""
     if "Location" not in df.columns:
@@ -83,45 +87,37 @@ if uploaded_file:
     df["_GL_Amt_numeric"] = clean_amount_series(df["GL Amt"]) if "GL Amt" in df.columns else 0.0
     df["GL Amt"] = df["_GL_Amt_numeric"].apply(lambda x: f"{x:.2f}")
 
-    # Clear specified columns for all rows
+    # Clear specified columns
     for col in ["Discount Amt", "Payables Cost Ctr", "Discount Cost Ctr", "Discount Acct"]:
         if col in df.columns:
             df[col] = None
 
-    # Update Bank Cost Ctr based on Location for all non-balancing rows
-    if "Location" in df.columns and "Bank Cost Ctr" in df.columns:
-        df.loc[df["Location"].isin(["01","03"]), "Bank Cost Ctr"] = "001"
-        df.loc[df["Location"].isin(["02","04"]), "Bank Cost Ctr"] = "000"
+    # Ensure Bank and Payables columns exist
+    for col in ["Bank Cost Ctr", "Bank Acct #", "Payables Cost Ctr", "Payables Acct"]:
+        if col not in df.columns:
+            df[col] = None
 
-    # Prepare numeric Discount Amt for balancing row
-    df["_Discount_Amt_numeric"] = clean_amount_series(df["Discount Amt"]) if "Discount Amt" in df.columns else 0.0
+    # Update Bank/Payables based on Location
+    if "Location" in df.columns:
+        mask_01_03 = df["Location"].isin(["01","03"])
+        mask_02_04 = df["Location"].isin(["02","04"])
 
-    # Insert balancing rows
-    if "Record ID" in df.columns:
-        new_rows = []
-        for rid, group in df.groupby("Record ID", sort=False):
-            balancing_row = {col: None for col in df.columns}
-            balancing_row["Record ID"] = rid
-            balancing_row["GL Amt"] = f"{-group['_GL_Amt_numeric'].sum():.2f}" if "_GL_Amt_numeric" in group.columns else None
-            balancing_row["Discount Amt"] = None
-            balancing_row["Company"] = group["Company"].iloc[0] if "Company" in group.columns else None
-            balancing_row["Division"] = group["Division"].iloc[0] if "Division" in group.columns else None
-            balancing_row["Purchase Date"] = group["Purchase Date"].iloc[0] if "Purchase Date" in group.columns else None
-            balancing_row["Vendor#"] = "BANK" if "Vendor#" in df.columns else None
-            balancing_row["Invoice #"] = "RAMP PAYMENT" if "Invoice #" in df.columns else None
-            balancing_row["GL Cost Ctr"] = None
-            balancing_row["Payables Cost Ctr"] = None
-            balancing_row["Discount Cost Ctr"] = None
-            balancing_row["Discount Acct"] = None
-            # Bank Cost Ctr removed from balancing rows
-            new_rows.append(pd.DataFrame([balancing_row]))
-            new_rows.append(group.drop(columns=["_GL_Amt_numeric","_Discount_Amt_numeric"], errors="ignore"))
-        df = pd.concat(new_rows, ignore_index=True, sort=False)
-    else:
-        df = df.drop(columns=["_GL_Amt_numeric","_Discount_Amt_numeric"], errors="ignore")
+        df.loc[mask_01_03, "Bank Cost Ctr"] = "001"
+        df.loc[mask_01_03, "Bank Acct #"] = "10130"
+        df.loc[mask_01_03, "Payables Cost Ctr"] = "000"
+        df.loc[mask_01_03, "Payables Acct"] = "20010"
+
+        df.loc[mask_02_04, "Bank Cost Ctr"] = "000"
+        df.loc[mask_02_04, "Bank Acct #"] = "10138"
+        df.loc[mask_02_04, "Payables Cost Ctr"] = "000"
+        df.loc[mask_02_04, "Payables Acct"] = "20011"
+
+    # Overwrite Invoice Total with sum of GL Amt per Record ID
+    if "Record ID" in df.columns and "Invoice Total" in df.columns:
+        df["Invoice Total"] = df.groupby("Record ID")["_GL_Amt_numeric"].transform("sum").apply(lambda x: f"{x:.2f}")
 
     # Remove helper and unwanted columns
-    df = df.drop(columns=["_GL_Amt_numeric","_Discount_Amt_numeric","_original_index",
+    df = df.drop(columns=["_GL_Amt_numeric","_original_index",
                           "Department","Location","TransactionID","Vendor","Row_Sum"], errors="ignore").reset_index(drop=True)
 
     # Convert all text to uppercase (checked by default)
@@ -132,7 +128,7 @@ if uploaded_file:
     st.subheader("Modified CSV Preview")
     st.dataframe(df)
 
-    # Updated download buttons with dynamic file names
+    # Download buttons
     modified_csv_name = f"IntelliDealer_Upload_{uploaded_file.name}"
     csv_download = df.to_csv(index=False, encoding="utf-8").encode("utf-8")
     st.download_button(
