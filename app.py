@@ -1,12 +1,17 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import io
 import os
 
 st.set_page_config(page_title="CSV Manipulator", layout="wide")
 st.title("📊 CSV Manipulator App")
 
 def clean_amount_series(s):
+    """
+    Convert amount-like strings into numeric floats.
+    Handles: commas, dollar signs, parentheses for negatives, spaces.
+    """
     s = s.astype(str).fillna("").str.strip()
     paren_mask = s.str.match(r'^\(.*\)$', na=False)
     cleaned = s.str.replace(r'[\(\)\$,\s]', '', regex=True)
@@ -17,31 +22,25 @@ def clean_amount_series(s):
 
 uploaded_file = st.file_uploader("Upload a CSV file", type="csv")
 
+# Option: uppercase by default
+uppercase = st.checkbox("Convert all text to UPPERCASE", value=True)
+
 if uploaded_file:
     original_filename = os.path.splitext(uploaded_file.name)[0]
 
-    dtype_cols = [
-        "Invoice #", "GL Acct", "Vendor", "Vendor#", "Company", "Division", "Discount Amt",
-        "Bank Cost Ctr", "Payables Cost Ctr", "Department", "Location", "Invoice Total",
-        "Bank Acct #", "Payables Acct"
-    ]
-    tmp = pd.read_csv(uploaded_file, nrows=0)
-    existing_dtype_cols = [c for c in dtype_cols if c in tmp.columns]
-    dtype_map = {col: str for col in existing_dtype_cols}
-    uploaded_file.seek(0)
-    df = pd.read_csv(uploaded_file, dtype=dtype_map)
+    # Read everything as strings so leading zeros are preserved for key columns
+    df = pd.read_csv(uploaded_file, dtype=str).fillna("")
 
-    df = df.dropna(how="all").reset_index(drop=True)
+    # Normalize header names (trim spaces)
+    df.columns = df.columns.str.strip()
+
+    # Keep original order index
     df["_original_index"] = np.arange(len(df))
 
-    # Make GL Acct string
+    # --- Separate out GL Acct = 99999 rows early (export parts file later) ---
+    parts_df = pd.DataFrame()
     if "GL Acct" in df.columns:
-        df["GL Acct"] = df["GL Acct"].astype(str)
-
-    # Filter out GL Acct 99999 rows
-    filtered_out = pd.DataFrame()
-    if "GL Acct" in df.columns:
-        filtered_out = df[df["GL Acct"] == "99999"].copy()
+        parts_df = df[df["GL Acct"] == "99999"].copy()
         df = df[df["GL Acct"] != "99999"].copy()
 
     st.subheader("Preview of Uploaded CSV")
@@ -49,146 +48,152 @@ if uploaded_file:
 
     st.subheader("Manipulation Options")
 
-    # Format Purchase Date and fill empty Invoice #
-    if st.checkbox("Format 'Purchase Date' as yyyyMMdd and fill empty 'Invoice #'", value=True):
-        if "Purchase Date" in df.columns:
-            df["Purchase Date"] = pd.to_datetime(df["Purchase Date"], errors="coerce")
-            df["Purchase Date"] = df["Purchase Date"].dt.strftime("%Y%m%d")
-        else:
-            df["Purchase Date"] = ""
-        if "Invoice #" in df.columns and "Vendor" in df.columns:
-            mask_empty_invoice = df["Invoice #"].isna() | (df["Invoice #"].astype(str).str.strip() == "")
-            df.loc[mask_empty_invoice, "Invoice #"] = (
-                df.loc[mask_empty_invoice, "Vendor"].astype(str) + "_" + df.loc[mask_empty_invoice, "Purchase Date"].astype(str)
-            )
-            df["Invoice #"] = df["Invoice #"].astype(str)
-        else:
-            if "Invoice #" not in df.columns:
-                df["Invoice #"] = ""
-            if "Vendor" not in df.columns:
-                df["Vendor"] = ""
+    # --- Purchase Date formatting and fill empty Invoice # ---
+    # Format Purchase Date to yyyyMMdd (if exists)
+    if "Purchase Date" in df.columns:
+        df["Purchase Date"] = pd.to_datetime(df["Purchase Date"], errors="coerce").dt.strftime("%Y%m%d")
+        df["Purchase Date"] = df["Purchase Date"].fillna("")
+    else:
+        df["Purchase Date"] = ""
 
-    # Normalize Location
+    # Fill empty Invoice # with Vendor_yyyyMMdd; support both "Vendor" and "Vendor#"
+    vendor_col = "Vendor" if "Vendor" in df.columns else ("Vendor#" if "Vendor#" in df.columns else None)
+    if "Invoice #" not in df.columns:
+        df["Invoice #"] = ""
+    if vendor_col:
+        mask_empty_invoice = (df["Invoice #"].astype(str).str.strip() == "")
+        df.loc[mask_empty_invoice, "Invoice #"] = (
+            df.loc[mask_empty_invoice, vendor_col].astype(str) + "_" + df.loc[mask_empty_invoice, "Purchase Date"].astype(str)
+        )
+    df["Invoice #"] = df["Invoice #"].astype(str)
+
+    # --- Normalize Location (preserve leading zero if present) ---
     if "Location" not in df.columns:
         df["Location"] = ""
     df["Location"] = df["Location"].astype(str).str.strip().replace("", np.nan)
     df["Location"] = df["Location"].fillna("").apply(lambda x: x.zfill(2) if x != "" else "")
 
-    # Ensure Bank/Payables columns exist
+    # --- Ensure Bank/Payables columns exist BEFORE assigning values ---
     for col in ["Bank Cost Ctr", "Bank Acct #", "Payables Cost Ctr", "Payables Acct"]:
         if col not in df.columns:
-            df[col] = None
+            df[col] = ""
 
-    # Bank/Payables assignment
+    # --- Assign Bank & Payables values based on Location (applies to all rows) ---
     mask_01_03 = df["Location"].isin(["01", "03"])
     mask_02_04 = df["Location"].isin(["02", "04"])
+
     df.loc[mask_01_03, "Bank Cost Ctr"] = "001"
     df.loc[mask_01_03, "Bank Acct #"] = "10130"
     df.loc[mask_01_03, "Payables Cost Ctr"] = "000"
     df.loc[mask_01_03, "Payables Acct"] = "20010"
+
     df.loc[mask_02_04, "Bank Cost Ctr"] = "000"
     df.loc[mask_02_04, "Bank Acct #"] = "10138"
     df.loc[mask_02_04, "Payables Cost Ctr"] = "000"
     df.loc[mask_02_04, "Payables Acct"] = "20011"
 
-    # Prepare GL Amt numeric
+    # --- Prepare numeric GL Amt helper for accurate sums ---
     if "GL Amt" in df.columns:
         df["_GL_Amt_numeric"] = clean_amount_series(df["GL Amt"]).fillna(0.0)
     else:
         df["_GL_Amt_numeric"] = 0.0
 
-    # Build GL Cost Ctr = Department + Location (no leading zeros on Department)
+    # --- Build GL Cost Ctr before we drop Department/Location ---
     if "Department" in df.columns and "Location" in df.columns:
+        # Department kept as-is (no extra leading zeros), Location kept as-is
         df["GL Cost Ctr"] = df["Department"].astype(str) + df["Location"].astype(str)
 
-    # ---------- RECORD ID & Invoice # assignment ----------
+    # --- Clear only the specified discount-related columns (KEEP Payables Cost Ctr) ---
+    for col in ["Discount Amt", "Discount Cost Ctr", "Discount Acct"]:
+        if col in df.columns:
+            df[col] = ""
+
+    # ---------- RECORD ID assignment (one per Invoice, except multiple Bank Acct# => multiple IDs) ----------
     df["Record ID"] = np.nan
     loc_suffix_map = {"01": "W", "03": "M", "02": "F", "04": "G"}
-    result_rows = []
-    record_id = 0
 
-    # Process each invoice in original order
+    result_groups = []
+    record_id_counter = 0
+
+    # Process invoices in the order they originally appeared
     for invoice in df.sort_values("_original_index")["Invoice #"].unique():
         inv_df = df[df["Invoice #"] == invoice]
-        bank_counts = inv_df["Bank Acct #"].nunique()
+        # Count unique Bank Acct # for this invoice
+        unique_bank_count = inv_df["Bank Acct #"].nunique()
 
-        if bank_counts == 1:
-            # Single Bank Acct # → one Record ID
-            record_id += 1
+        if unique_bank_count <= 1:
+            # Single Bank Acct #: treat entire invoice as one Record ID
+            record_id_counter += 1
             group = inv_df.copy()
             unique_locs = [loc for loc in pd.unique(group["Location"]) if loc in loc_suffix_map]
             suffixes = "".join(sorted([loc_suffix_map[loc] for loc in unique_locs]))
-            new_invoice = str(invoice).strip()
+            new_invoice_label = str(invoice).strip()
             if suffixes:
-                new_invoice = f"{new_invoice} {suffixes}"
-            group["Invoice #"] = new_invoice
-            group["Record ID"] = record_id
-            result_rows.append(group)
+                new_invoice_label = f"{new_invoice_label} {suffixes}"
+            group["Invoice #"] = new_invoice_label
+            group["Record ID"] = record_id_counter
+            result_groups.append(group)
         else:
-            # Multiple Bank Acct #s → sort by Bank Acct # within invoice, separate Record ID per Bank Acct #
-            for bank, group in inv_df.groupby("Bank Acct #", sort=False):
-                record_id += 1
-                group = group.copy()
+            # Multiple Bank Acct #: create one Record ID per Bank Acct # and sort rows by Bank Acct # within this invoice
+            # Preserve original order within each bank group
+            for bank_acct, sub in inv_df.groupby("Bank Acct #", sort=False):
+                record_id_counter += 1
+                group = sub.copy()
                 unique_locs = [loc for loc in pd.unique(group["Location"]) if loc in loc_suffix_map]
                 suffixes = "".join(sorted([loc_suffix_map[loc] for loc in unique_locs]))
-                new_invoice = str(invoice).strip()
+                new_invoice_label = str(invoice).strip()
                 if suffixes:
-                    new_invoice = f"{new_invoice} {suffixes}"
-                group["Invoice #"] = new_invoice
-                group["Record ID"] = record_id
-                result_rows.append(group)
+                    new_invoice_label = f"{new_invoice_label} {suffixes}"
+                group["Invoice #"] = new_invoice_label
+                group["Record ID"] = record_id_counter
+                result_groups.append(group)
 
-    # Combine all rows, preserving original order where possible
-    df = pd.concat(result_rows).sort_values("Record ID").reset_index(drop=True)
+    # Combine all result groups and then sort by Record ID so rows with same Record ID are sequential
+    df = pd.concat(result_groups, ignore_index=True, sort=False)
+    df = df.sort_values("Record ID").reset_index(drop=True)
 
-    # Invoice Total = sum of GL Amt per Record ID
+    # --- Overwrite Invoice Total with sum of GL Amt per Record ID (format as 2 decimals) ---
     if "Invoice Total" not in df.columns:
-        df["Invoice Total"] = None
-    df["Invoice Total"] = df.groupby("Record ID")["_GL_Amt_numeric"].transform("sum").apply(lambda x: f"{x:.2f}")
+        df["Invoice Total"] = ""
+    if "Record ID" in df.columns:
+        invoice_totals = df.groupby("Record ID")["_GL_Amt_numeric"].transform("sum")
+        df["Invoice Total"] = invoice_totals.apply(lambda x: f"{x:.2f}")
 
-    # GL Amt formatted
+    # Format GL Amt as 2-decimal string (no dollar signs)
     df["GL Amt"] = df["_GL_Amt_numeric"].apply(lambda x: f"{x:.2f}")
 
-    # Clear specified columns
-    for col in ["Discount Amt", "Payables Cost Ctr", "Discount Cost Ctr", "Discount Acct"]:
-        if col in df.columns:
-            df[col] = None
+    # Drop helper columns and optionally drop originals we don't want exported
+    drop_cols = ["_GL_Amt_numeric", "_original_index", "Department", "Location", "TransactionID", "Vendor", "Row_Sum"]
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore").reset_index(drop=True)
 
-    # Drop helper/unwanted columns
-    df = df.drop(columns=["_GL_Amt_numeric", "_original_index",
-                          "Department", "Location", "TransactionID", "Vendor", "Row_Sum"], errors="ignore").reset_index(drop=True)
-
-    # Convert all text to uppercase
-    if st.checkbox("Convert all text to UPPERCASE", value=True):
-        for col in df.select_dtypes(include='object').columns:
+    # Apply uppercase if selected (do parts_df too)
+    if uppercase:
+        for col in df.select_dtypes(include="object").columns:
             df[col] = df[col].str.upper()
+        if not parts_df.empty:
+            for col in parts_df.select_dtypes(include="object").columns:
+                parts_df[col] = parts_df[col].str.upper()
 
+    # --- Preview and QA summary ---
     st.subheader("Modified CSV Preview")
     st.dataframe(df)
 
     st.subheader("Record ID Summary (Quick QA)")
     summary_cols = ["Record ID", "Invoice #", "Bank Acct #", "Invoice Total"]
-    summary_cols = [col for col in summary_cols if col in df.columns]
-
+    summary_cols = [c for c in summary_cols if c in df.columns]
     if summary_cols:
         summary_df = df[summary_cols].drop_duplicates(subset=["Record ID", "Bank Acct #"]).sort_values("Record ID").reset_index(drop=True)
         st.dataframe(summary_df)
 
-
-    # Download buttons
+    # --- Downloads ---
     modified_csv_name = f"IntelliDealer_Upload_{uploaded_file.name}"
-    csv_download = df.to_csv(index=False, encoding="utf-8").encode("utf-8")
-    st.download_button(label="📥 Download Modified CSV",
-                       data=csv_download,
-                       file_name=modified_csv_name,
-                       mime="text/csv")
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(label="📥 Download Modified CSV", data=csv_bytes, file_name=modified_csv_name, mime="text/csv")
 
-    if not filtered_out.empty:
-        filtered_name = f"{original_filename}_PARTS.csv"
-        filtered_download = filtered_out.to_csv(index=False, encoding="utf-8").encode("utf-8")
-        st.download_button(label="📥 Download GL Acct 99999 Rows",
-                           data=filtered_download,
-                           file_name=filtered_name,
-                           mime="text/csv")
+    if not parts_df.empty:
+        parts_name = f"{original_filename}_PARTS.csv"
+        parts_bytes = parts_df.to_csv(index=False).encode("utf-8")
+        st.download_button(label="📥 Download GL Acct 99999 Rows", data=parts_bytes, file_name=parts_name, mime="text/csv")
+
 else:
     st.info("👆 Upload a CSV file to get started")
